@@ -28,10 +28,13 @@
 import itertools
 import operator
 import os
+import os.path
 import re
 import struct
 import sys
 import time
+import zlib
+import cStringIO as StringIO
 
 izip = getattr(itertools, 'izip', zip)
 ifilter = getattr(itertools, 'ifilter', filter)
@@ -51,6 +54,10 @@ try:
   CAN_FALLOCATE = True
 except ImportError:
   CAN_FALLOCATE = False
+
+NO_COMPRESSION = 'none'
+AUTO_COMPRESSION = 'auto'
+ZLIB_COMPRESSION = 'zlib'
 
 fallocate = None
 
@@ -194,6 +201,102 @@ class CorruptWhisperFile(WhisperException):
     return "%s (%s)" % (self.error, self.path)
 
 
+class CompressedFile(object):
+    ZLIB = 'z'
+
+    def __init__(self, filename, mode, format=ZLIB):
+        self._fh = open(filename, mode)
+        self._format = format
+        self._dirty = False
+
+        if mode[0] == 'r':
+            data = self._fh.read()
+            if format == self.ZLIB:
+                data = zlib.decompress(data)
+            else:
+                raise CorruptWhisperFile('invalid compression format', filename)
+        else:
+            data = ''
+        self._data = StringIO.StringIO()
+        self._data.write(data)
+        self._data.seek(0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        if not self._fh.closed:
+            self._fh.flush()
+            self._fh.close()
+
+    @property
+    def name(self):
+        return self._fh.name
+
+    @property
+    def closed(self):
+        return self._fh.closed
+
+    def write(self, data):
+        self._data.write(data)
+        self._dirty = True
+
+    def read(self, size=0):
+        return self._data.read(size)
+
+    def fileno(self):
+        return self._fh.fileno()
+
+    def tell(self):
+        return self._data.tell()
+
+    def flush(self):
+        if not self._dirty:
+            return
+        data = self._data.getvalue()
+        if len(data) >= 4096:
+            if self._format == self.ZLIB:
+                data = zlib.compress(data, 1)
+        pos = self._fh.tell()
+        self._fh.seek(0)
+        self._fh.write(data)
+        self._fh.flush()
+        self._dirty = False
+
+    def close(self):
+        self.flush()
+        self._fh.close()
+
+    def seek(self, offset, whence=0):
+        self._data.seek(offset, whence)
+
+    def __iter__(self):
+        return self
+
+class wopen(object):
+    def __init__(self, filename, mode='r', compression=AUTO_COMPRESSION):
+        if compression == NO_COMPRESSION:
+            self.fh = open(filename, mode)
+        elif compression == ZLIB_COMPRESSION:
+            self.fh = CompressedFile(filename, mode, CompressedFile.ZLIB)
+        elif compression == AUTO_COMPRESSION:
+            with open(filename, 'r') as fh:
+                header = fh.read(2)
+            # TODO: use our own header.
+            if header[:1] == chr(0x78):
+                self.fh = CompressedFile(filename, mode, CompressedFile.ZLIB)
+            else:
+                self.fh = open(filename, mode)
+
+    def __enter__(self):
+        return self.fh
+
+    def __exit__(self, type, value, traceback):
+        if not self.fh.closed:
+            self.fh.flush()
+            self.fh.close()
+
+
 def enableDebug():
   global open, debug, startBlock, endBlock
 
@@ -235,7 +338,6 @@ def __readHeader(fh):
   originalOffset = fh.tell()
   fh.seek(0)
   packedMetadata = fh.read(metadataSize)
-
   try:
     (aggregationType, maxRetention, xff, archiveCount) = struct.unpack(metadataFormat, packedMetadata)
   except:
@@ -279,7 +381,7 @@ path is a string
 aggregationMethod specifies the method to use when propagating data (see ``whisper.aggregationMethods``)
 xFilesFactor specifies the fraction of data points in a propagation interval that must have known values for a propagation to occur.  If None, the existing xFilesFactor in path will not be changed
 """
-  with open(path, 'r+b') as fh:
+  with wopen(path, 'r+b') as fh:
     if LOCK:
       fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
 
@@ -373,13 +475,16 @@ def validateArchiveList(archiveList):
         (i + 1, pointsPerConsolidation, i, archivePoints))
 
 
-def create(path, archiveList, xFilesFactor=None, aggregationMethod=None, sparse=False, useFallocate=False):
+def create(path, archiveList, xFilesFactor=None, aggregationMethod=None, sparse=False, useFallocate=False, compression=NO_COMPRESSION):
   """create(path,archiveList,xFilesFactor=0.5,aggregationMethod='average')
 
 path is a string
 archiveList is a list of archives, each of which is of the form (secondsPerPoint,numberOfPoints)
 xFilesFactor specifies the fraction of data points in a propagation interval that must have known values for a propagation to occur
 aggregationMethod specifies the function to use when propagating data (see ``whisper.aggregationMethods``)
+sparse enable or disable sparse files
+useFallocate controls the use of fallocate() when allocating files
+compression enables support for compressed files
 """
   # Set default params
   if xFilesFactor is None:
@@ -394,7 +499,7 @@ aggregationMethod specifies the function to use when propagating data (see ``whi
   if os.path.exists(path):
     raise InvalidConfiguration("File %s already exists!" % path)
 
-  with open(path, 'wb') as fh:
+  with wopen(path, 'wb', compression) as fh:
     try:
       if LOCK:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
@@ -554,7 +659,7 @@ def update(path, value, timestamp=None):
   timestamp is either an int or float
   """
   value = float(value)
-  with open(path, 'r+b') as fh:
+  with wopen(path, 'r+b') as fh:
     return file_update(fh, value, timestamp)
 
 
@@ -618,7 +723,7 @@ points is a list of (timestamp,value) points
   if not points: return
   points = [(int(t), float(v)) for (t, v) in points]
   points.sort(key=lambda p: p[0], reverse=True)  # Order points by timestamp, newest first
-  with open(path, 'r+b') as fh:
+  with wopen(path, 'r+b') as fh:
     return file_update_many(fh, points)
 
 
@@ -738,7 +843,7 @@ def info(path):
   path is a string
   """
   try:
-    with open(path, 'rb') as fh:
+    with wopen(path, 'rb') as fh:
       return __readHeader(fh)
   except (IOError, OSError):
     pass
@@ -757,7 +862,7 @@ where timeInfo is itself a tuple of (fromTime, untilTime, step)
 
 Returns None if no data can be returned
 """
-  with open(path, 'rb') as fh:
+  with wopen(path, 'rb') as fh:
     return file_fetch(fh, fromTime, untilTime, now)
 
 
@@ -873,8 +978,8 @@ def merge(path_from, path_to):
   # with open(path_from, 'rb') as fh_from, open(path_to, 'rb+') as fh_to:
   # But with Python 2.6 we need to use this (I prefer not to introduce
   # contextlib.nested just for this):
-  with open(path_from, 'rb') as fh_from:
-    with open(path_to, 'rb+') as fh_to:
+  with wopen(path_from, 'rb') as fh_from:
+    with wopen(path_to, 'rb+') as fh_to:
       return file_merge(fh_from, fh_to)
 
 
@@ -904,8 +1009,8 @@ def file_merge(fh_from, fh_to):
 
 def diff(path_from, path_to, ignore_empty=False):
   """ Compare two whisper databases. Each file must have the same archive configuration """
-  with open(path_from, 'rb') as fh_from:
-    with open(path_to, 'rb+') as fh_to:
+  with wopen(path_from, 'rb') as fh_from:
+    with wopen(path_to, 'rb+') as fh_to:
       return file_diff(fh_from, fh_to, ignore_empty)
 
 

@@ -112,9 +112,12 @@ class AssertRaisesException(object):
 
 
 class WhisperTestBase(unittest.TestCase):
+
     def setUp(self):
         self.filename = 'db.wsp'
         self.retention = [(1, 60), (60, 60)]
+        self.sparse = False
+        self.compression = whisper.NO_COMPRESSION
 
     def tearDown(self):
         self._remove(self.filename)
@@ -253,14 +256,17 @@ class TestWhisper(WhisperTestBase):
         # check if invalid configuration fails successfully
         for retention in (0, []):
             with AssertRaisesException(whisper.InvalidConfiguration('You must specify at least one archive configuration!')):
-                whisper.create(self.filename, retention)
+                whisper.create(self.filename, retention,
+                               sparse=self.sparse, compression=self.compression)
 
         # create a new db with a valid configuration
-        whisper.create(self.filename, self.retention)
+        whisper.create(self.filename, self.retention,
+                       sparse=self.sparse, compression=self.compression)
 
         # Ensure another file can't be created when one exists already
         with AssertRaisesException(whisper.InvalidConfiguration('File {0} already exists!'.format(self.filename))):
-            whisper.create(self.filename, self.retention)
+            whisper.create(self.filename, self.retention,
+                           sparse=self.sparse, compression=self.compression)
 
         info = whisper.info(self.filename)
 
@@ -284,7 +290,8 @@ class TestWhisper(WhisperTestBase):
         self.assertIsNone(whisper.info('bogus-file'))
 
         # Validate "corrupt" whisper metadata
-        whisper.create(self.filename, self.retention)
+        whisper.create(self.filename, self.retention,
+                       sparse=self.sparse, compression=self.compression)
         with SimulatedCorruptWhisperFile():
             with AssertRaisesException(whisper.CorruptWhisperFile('Unable to read header', self.filename)):
                 whisper.info(self.filename)
@@ -299,9 +306,10 @@ class TestWhisper(WhisperTestBase):
         Test some of the edge cases in file_fetch() that should return
         None or raise an exception
         """
-        whisper.create(self.filename, [(1, 60)])
+        whisper.create(self.filename, [(1, 60)],
+                       sparse=self.sparse, compression=self.compression)
 
-        with open(self.filename, 'rb') as fh:
+        with whisper.wopen(self.filename, 'rb') as fh:
             msg = "Invalid time interval: from time '{0}' is after until time '{1}'"
             until_time = 0
             from_time = int(time.time()) + 100
@@ -346,9 +354,10 @@ class TestWhisper(WhisperTestBase):
 
         # Create 2 whisper databases with different schema
         self._update()
-        whisper.create(testdb, [(100, 1)])
+        whisper.create(testdb, [(100, 1)],
+                       sparse=self.sparse, compression=self.compression)
 
-        with AssertRaisesException(NotImplementedError('db.wsp and test-db.wsp archive configurations are unalike. Resize the input before merging')):
+        with AssertRaisesException(NotImplementedError('%s and %s archive configurations are unalike. Resize the input before merging' % (self.filename, testdb))):
             whisper.merge(self.filename, testdb)
 
         self._remove(testdb)
@@ -358,8 +367,10 @@ class TestWhisper(WhisperTestBase):
 
         now = time.time()
 
-        whisper.create(testdb, self.retention)
-        whisper.create(self.filename, self.retention)
+        whisper.create(testdb, self.retention,
+                       sparse=self.sparse, compression=self.compression)
+        whisper.create(self.filename, self.retention,
+                       sparse=self.sparse, compression=self.compression)
         whisper.update(testdb, 1.0, now)
         whisper.update(self.filename, 2.0, now)
 
@@ -375,8 +386,10 @@ class TestWhisper(WhisperTestBase):
 
         now = time.time()
 
-        whisper.create(testdb, self.retention)
-        whisper.create(self.filename, self.retention)
+        whisper.create(testdb, self.retention,
+                       sparse=self.sparse, compression=self.compression)
+        whisper.create(self.filename, self.retention,
+                       sparse=self.sparse, compression=self.compression)
         whisper.update(testdb, 1.0, now)
         whisper.update(self.filename, 2.0, now)
 
@@ -414,14 +427,16 @@ class TestWhisper(WhisperTestBase):
 
         now = time.time()
 
-        whisper.create(testdb, self.retention)
-        whisper.create(self.filename, self.retention)
+        whisper.create(testdb, self.retention,
+                       sparse=self.sparse, compression=self.compression)
+        whisper.create(self.filename, self.retention,
+                       sparse=self.sparse, compression=self.compression)
         whisper.update(testdb, 1.0, now)
         whisper.update(self.filename, 2.0, now)
 
         # Merging 2 archives with different retentions should fail
-        with open(testdb, 'rb') as fh_1:
-            with open(self.filename, 'rb+') as fh_2:
+        with whisper.wopen(testdb, 'rb') as fh_1:
+            with whisper.wopen(self.filename, 'rb+') as fh_2:
                 results = whisper.file_diff(fh_1, fh_2)
         self._remove(testdb)
 
@@ -432,13 +447,15 @@ class TestWhisper(WhisperTestBase):
     def test_file_diff_invalid(self):
         testdb = "test-%s" % self.filename
 
-        whisper.create(testdb, [(120, 10)])
-        whisper.create(self.filename, self.retention)
+        whisper.create(testdb, [(120, 10)],
+                       sparse=self.sparse, compression=self.compression)
+        whisper.create(self.filename, self.retention,
+                       sparse=self.sparse, compression=self.compression)
 
         # Merging 2 archives with different retentions should fail
-        with open(testdb, 'rb') as fh_1:
-            with open(self.filename, 'rb+') as fh_2:
-                with AssertRaisesException(NotImplementedError('test-db.wsp and db.wsp archive configurations are unalike. Resize the input before diffing')):
+        with whisper.wopen(testdb, 'rb') as fh_1:
+            with whisper.wopen(self.filename, 'rb+') as fh_2:
+                with AssertRaisesException(NotImplementedError('%s and %s archive configurations are unalike. Resize the input before diffing' % (testdb, self.filename))):
                     whisper.file_diff(fh_1, fh_2)
         self._remove(testdb)
 
@@ -456,7 +473,8 @@ class TestWhisper(WhisperTestBase):
 
         # SECOND MINUTE HOUR DAY
         retention = [(1, 60), (60, 60), (3600, 24), (86400, 365)]
-        whisper.create(self.filename, retention)
+        whisper.create(self.filename, retention,
+                       sparse=self.sparse, compression=self.compression)
 
         # check a db with an invalid time range
         now = int(time.time())
@@ -485,7 +503,8 @@ class TestWhisper(WhisperTestBase):
         num_data_points = 20
 
         # create sample data
-        whisper.create(wsp, schema)
+        whisper.create(wsp, schema,
+                       sparse=self.sparse, compression=self.compression)
         tn = time.time() - num_data_points
         data = []
         for i in range(num_data_points):
@@ -545,7 +564,8 @@ class TestWhisper(WhisperTestBase):
         whisper.AUTOFLUSH = True
         whisper.CACHE_HEADERS = True
         # create a new db with a valid configuration
-        whisper.create(self.filename, self.retention)
+        whisper.create(self.filename, self.retention,
+                       sparse=self.sparse, compression=self.compression)
 
         with AssertRaisesException(whisper.InvalidAggregationMethod('Unrecognized aggregation method: yummy beer')):
             whisper.setAggregationMethod(self.filename, 'yummy beer')
@@ -602,12 +622,33 @@ class TestgetUnitString(unittest.TestCase):
 # TODO: Find a way to pass in corrupt whisper files that don't deadlock the testing box
 class TestReadHeader(WhisperTestBase):
     def test_normal(self):
-        whisper.create(self.filename, [(1, 60), (60, 60)])
+        whisper.create(self.filename, [(1, 60), (60, 60)],
+                       sparse=self.sparse, compression=self.compression)
 
         whisper.CACHE_HEADERS = True
         whisper.info(self.filename)
         whisper.info(self.filename)
         whisper.CACHE_HEADERS = False
+
+
+class TestWhisperSparse(TestWhisper):
+    def setUp(self):
+        super(TestWhisperSparse, self).setUp()
+        self.filename = 'db-sparse.wsp'
+        self.sparse = True
+
+
+class TestReadHeaderZlib(TestReadHeader):
+    def setUp(self):
+        super(TestReadHeaderZlib, self).setUp()
+        self.compression = whisper.ZLIB_COMPRESSION
+
+
+class TestWhisperZlib(TestWhisper):
+    def setUp(self):
+        super(TestWhisperZlib, self).setUp()
+        self.filename = 'db-zlib.wsp'
+        self.compression = whisper.ZLIB_COMPRESSION
 
 
 class TestParseRetentionDef(unittest.TestCase):
